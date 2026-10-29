@@ -7,6 +7,9 @@
 data
 autostart.log
 
+# Local notes and docs (kept out of the public repo; README.md and AGENTS.md are the published docs)
+docs/
+
 .DS_Store
 dist
 dts
