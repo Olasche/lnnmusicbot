@@ -1,0 +1,394 @@
+import {inject, injectable} from 'inversify';
+import {toSeconds, parse} from 'iso8601-duration';
+import got, {Got} from 'got';
+import pLimit from 'p-limit';
+import {SongMetadata, QueuedPlaylist, MediaSource} from './player.js';
+import {TYPES} from '../types.js';
+import Config from './config.js';
+import KeyValueCacheProvider from './key-value-cache.js';
+import {ONE_HOUR_IN_SECONDS, ONE_MINUTE_IN_SECONDS} from '../utils/constants.js';
+import {parseTime} from '../utils/time.js';
+import getYouTubeID from 'get-youtube-id';
+import {buildAudioFallbackQuery, rankAudioFallbackCandidates} from '../utils/youtube-audio-fallback.js';
+
+interface VideoDetailsResponse {
+  id: string;
+  contentDetails: {
+    videoId: string;
+    duration: string;
+    contentRating?: {
+      ytRating?: string;
+    };
+  };
+  snippet: {
+    title: string;
+    channelTitle: string;
+    liveBroadcastContent: string;
+    description: string;
+    thumbnails: {
+      medium: {
+        url: string;
+      };
+    };
+  };
+}
+
+interface PlaylistResponse {
+  id: string;
+  contentDetails: {
+    itemCount: number;
+  };
+  snippet: {
+    title: string;
+  };
+}
+
+interface PlaylistItemsResponse {
+  items: PlaylistItem[];
+  nextPageToken?: string;
+}
+
+interface PlaylistItem {
+  id: string;
+  contentDetails: {
+    videoId: string;
+  };
+}
+
+interface SearchResponse {
+  items: SearchItem[];
+}
+
+interface SearchItem {
+  id: {
+    videoId: string;
+  };
+}
+
+@injectable()
+export default class {
+  private readonly youtubeKey: string;
+  private readonly cache: KeyValueCacheProvider;
+  private readonly got: Got;
+  private readonly videoDetailsLimit = pLimit(3);
+
+  constructor(@inject(TYPES.Config) config: Config, @inject(TYPES.KeyValueCache) cache: KeyValueCacheProvider) {
+    this.youtubeKey = config.YOUTUBE_API_KEY;
+    this.cache = cache;
+
+    this.got = got.extend({
+      prefixUrl: 'https://www.googleapis.com/youtube/v3/',
+      searchParams: {
+        key: this.youtubeKey,
+        responseType: 'json',
+      },
+    });
+  }
+
+  async search(query: string, shouldSplitChapters: boolean): Promise<SongMetadata[]> {
+    const ids = await this.searchVideoIDs(query);
+
+    if (ids.length === 0) {
+      return [];
+    }
+
+    const videos = await this.getVideosByID(ids);
+    const firstVideo = ids
+      .map(id => videos.find(video => video.id === id))
+      .find(Boolean);
+
+    return firstVideo
+      ? this.getMetadataFromVideo({video: firstVideo, shouldSplitChapters})
+      : [];
+  }
+
+  async findAudioFallback(song: SongMetadata): Promise<SongMetadata | null> {
+    if (song.source !== MediaSource.Youtube || song.isLive) {
+      return null;
+    }
+
+    const query = buildAudioFallbackQuery(song);
+    if (!query) {
+      return null;
+    }
+
+    const ids = (await this.searchVideoIDs(query, {videoCategoryId: '10'}))
+      .filter(id => id !== song.url);
+    if (ids.length === 0) {
+      return null;
+    }
+
+    const videos = await this.getVideosByID(ids);
+    const candidates = ids
+      .map(id => videos.find(video => video.id === id))
+      .filter((video): video is VideoDetailsResponse => (
+        Boolean(video)
+        && video!.contentDetails.contentRating?.ytRating !== 'ytAgeRestricted'
+      ))
+      .flatMap(video => this.getMetadataFromVideo({video, shouldSplitChapters: false}));
+
+    return rankAudioFallbackCandidates(song, candidates).at(0) ?? null;
+  }
+
+  async getVideo(url: string, shouldSplitChapters: boolean): Promise<SongMetadata[]> {
+    const videoId = url.length === 11 ? url : getYouTubeID(url);
+
+    if (!videoId) {
+      throw new Error('Video could not be found.');
+    }
+
+    const result = await this.getVideosByID([videoId]);
+    const video = result.at(0);
+
+    if (!video) {
+      throw new Error('Video could not be found.');
+    }
+
+    return this.getMetadataFromVideo({video, shouldSplitChapters});
+  }
+
+  async getPlaylist(listId: string, shouldSplitChapters: boolean, playlistLimit = Number.POSITIVE_INFINITY): Promise<SongMetadata[]> {
+    if (playlistLimit < 1) {
+      return [];
+    }
+
+    const playlistParams = {
+      searchParams: {
+        part: 'id, snippet, contentDetails',
+        id: listId,
+      },
+    };
+    const {items: playlists} = await this.cache.wrap(
+      async () => this.got('playlists', playlistParams).json() as Promise<{items: PlaylistResponse[]}>,
+      playlistParams,
+      {
+        expiresIn: ONE_MINUTE_IN_SECONDS,
+      },
+    );
+
+    const playlist = playlists.at(0)!;
+
+    if (!playlist) {
+      throw new Error('Playlist could not be found.');
+    }
+
+    const queuedPlaylist = {title: playlist.snippet.title, source: playlist.id};
+    const songsToReturn: SongMetadata[] = [];
+    const requestedPageTokens = new Set<string>();
+
+    let nextToken: string | undefined;
+
+    do {
+      if (nextToken) {
+        requestedPageTokens.add(nextToken);
+      }
+
+      const playlistItemsParams = {
+        searchParams: {
+          part: 'id, contentDetails',
+          playlistId: listId,
+          maxResults: String(Math.min(50, Math.max(1, Math.floor(playlistLimit - songsToReturn.length)))),
+          pageToken: nextToken,
+        },
+      };
+
+      // eslint-disable-next-line no-await-in-loop
+      const {items, nextPageToken} = await this.cache.wrap(
+        async () => this.got('playlistItems', playlistItemsParams).json() as Promise<PlaylistItemsResponse>,
+        playlistItemsParams,
+        {
+          expiresIn: ONE_MINUTE_IN_SECONDS,
+        },
+      );
+
+      nextToken = nextPageToken;
+      if (items.length === 0) {
+        continue;
+      }
+
+      // Finish this page before fetching another: unavailable videos do not count
+      // toward the limit, while each split chapter does.
+      // eslint-disable-next-line no-await-in-loop
+      const videoDetails = await this.getVideosByID(items.map(item => item.contentDetails.videoId));
+      for (const video of items) {
+        try {
+          const tracks = this.getMetadataFromVideo({
+            video: videoDetails.find(item => item.id === video.contentDetails.videoId)!,
+            queuedPlaylist,
+            shouldSplitChapters,
+          });
+          songsToReturn.push(...tracks.slice(0, playlistLimit - songsToReturn.length));
+        } catch (_: unknown) {
+          // Private and deleted videos can be missing metadata or a duration.
+        }
+
+        if (songsToReturn.length >= playlistLimit) {
+          return songsToReturn;
+        }
+      }
+    } while (nextToken && !requestedPageTokens.has(nextToken));
+
+    return songsToReturn;
+  }
+
+  async getVideosAsPlaylist(videoIds: string[], queuedPlaylist: QueuedPlaylist, shouldSplitChapters: boolean): Promise<SongMetadata[]> {
+    const videoDetails: VideoDetailsResponse[] = [];
+
+    for (let i = 0; i < videoIds.length; i += 50) {
+      // eslint-disable-next-line no-await-in-loop
+      videoDetails.push(...await this.getVideosByID(videoIds.slice(i, i + 50)));
+    }
+
+    return videoIds.flatMap(videoId => {
+      const video = videoDetails.find(details => details.id === videoId);
+
+      if (!video) {
+        // Private and deleted videos come back without details
+        return [];
+      }
+
+      try {
+        return this.getMetadataFromVideo({video, queuedPlaylist, shouldSplitChapters});
+      } catch (_: unknown) {
+        return [];
+      }
+    });
+  }
+
+  private getMetadataFromVideo({
+    video,
+    queuedPlaylist,
+    shouldSplitChapters,
+  }: {
+    video: VideoDetailsResponse; // | YoutubePlaylistItem;
+    queuedPlaylist?: QueuedPlaylist;
+    shouldSplitChapters?: boolean;
+  }): SongMetadata[] {
+    const base: SongMetadata = {
+      source: MediaSource.Youtube,
+      title: video.snippet.title,
+      artist: video.snippet.channelTitle,
+      length: toSeconds(parse(video.contentDetails.duration)),
+      offset: 0,
+      url: video.id,
+      playlist: queuedPlaylist ?? null,
+      isLive: video.snippet.liveBroadcastContent === 'live',
+      thumbnailUrl: video.snippet.thumbnails.medium.url,
+    };
+
+    if (!shouldSplitChapters) {
+      return [base];
+    }
+
+    const chapters = this.parseChaptersFromDescription(video.snippet.description, base.length);
+
+    if (!chapters) {
+      return [base];
+    }
+
+    const tracks: SongMetadata[] = [];
+
+    for (const [label, {offset, length}] of chapters) {
+      tracks.push({
+        ...base,
+        offset,
+        length,
+        title: `${label} (${base.title})`,
+      });
+    }
+
+    return tracks;
+  }
+
+  private parseChaptersFromDescription(description: string, videoDurationSeconds: number) {
+    const chapters: Array<[string, {offset: number; length: number}]> = [];
+    let foundFirstTimestamp = false;
+
+    const foundTimestamps: Array<{name: string; offset: number}> = [];
+    for (const line of description.split('\n')) {
+      const timestamps = Array.from(line.matchAll(/(?:\d+:)+\d+/g));
+      if (timestamps?.length !== 1) {
+        continue;
+      }
+
+      if (!foundFirstTimestamp) {
+        if (/^0+(?::0+)+$/u.test(timestamps[0][0])) {
+          foundFirstTimestamp = true;
+        } else {
+          continue;
+        }
+      }
+
+      const timestamp = timestamps[0][0];
+      const seconds = parseTime(timestamp);
+      const chapterName = line.split(timestamp)[1].trim();
+
+      foundTimestamps.push({name: chapterName, offset: seconds});
+    }
+
+    const hasInvalidChapter = foundTimestamps.some(({name, offset}, index) => (
+      !name
+      || offset >= videoDurationSeconds
+      || (index > 0 && offset <= foundTimestamps[index - 1].offset)
+    ));
+
+    if (foundTimestamps.length === 0 || hasInvalidChapter) {
+      return null;
+    }
+
+    for (const [i, {name, offset}] of foundTimestamps.entries()) {
+      chapters.push([name, {
+        offset,
+        length: i === foundTimestamps.length - 1
+          ? videoDurationSeconds - offset
+          : foundTimestamps[i + 1].offset - offset,
+      }]);
+    }
+
+    return chapters;
+  }
+
+  private async searchVideoIDs(query: string, options: {videoCategoryId?: string} = {}): Promise<string[]> {
+    const searchParams: Record<string, string> = {
+      part: 'snippet',
+      q: query,
+      type: 'video',
+      maxResults: '10',
+    };
+
+    if (options.videoCategoryId) {
+      searchParams.videoCategoryId = options.videoCategoryId;
+    }
+
+    const params = {searchParams};
+    const {items} = await this.cache.wrap(
+      async () => this.got('search', params).json() as Promise<SearchResponse>,
+      params,
+      {
+        expiresIn: ONE_HOUR_IN_SECONDS,
+      },
+    );
+
+    return items
+      .map(item => item.id.videoId)
+      .filter(Boolean);
+  }
+
+  private async getVideosByID(videoIDs: string[]): Promise<VideoDetailsResponse[]> {
+    const p = {
+      searchParams: {
+        part: 'id, snippet, contentDetails',
+        id: videoIDs.join(','),
+      },
+    };
+
+    const {items: videos} = await this.cache.wrap(
+      async () => this.videoDetailsLimit(async () => this.got('videos', p).json() as Promise<{items: VideoDetailsResponse[]}>),
+      p,
+      {
+        expiresIn: ONE_HOUR_IN_SECONDS,
+      },
+    );
+    return videos;
+  }
+}

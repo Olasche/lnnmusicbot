@@ -1,0 +1,4 @@
+# Keep LF everywhere, including on Windows checkouts (Git for Windows defaults to core.autocrlf=true).
+# .env.example is turned into a Docker --env-file, which must not contain CRs.
+* text=auto eol=lf
+*.png binary
